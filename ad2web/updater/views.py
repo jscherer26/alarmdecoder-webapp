@@ -2,7 +2,7 @@
 
 import json
 
-from flask import Blueprint, render_template, abort, g, request, flash, Response
+from flask import Blueprint, render_template, abort, g, request, flash, Response, redirect, url_for
 from flask import current_app as APP
 from flask.ext.login import login_required, current_user
 
@@ -40,3 +40,17 @@ def restart():
     APP.decoder.trigger_restart = True
 
     return json.dumps({ 'status': 'PASS' })
+
+@updater.route('/checkavailable', methods=['GET'])
+def checkavailable():
+    return json.dumps({ 'status': 'PASS' })
+
+@updater.route('/check_for_updates', methods=['GET'])
+@login_required
+@admin_required
+def check_for_updates():
+    APP.decoder.updates = APP.decoder.updater.check_updates()
+    update_available = not all(not needs_update for component, (needs_update, branch, revision, new_revision, status) in APP.decoder.updates.iteritems())
+    APP.jinja_env.globals['update_available'] = update_available
+
+    return redirect(url_for('update.index'))

@@ -1,10 +1,11 @@
 CONFIG = {
     'working_dir': '/opt/alarmdecoder-webapp',
     'user': 'pi',
-    'group': 'pi',
+    'group': 'dialout',
     'args': (
         '--worker-class=socketio.sgunicorn.GeventSocketIOWorker',
         '--timeout=120',
+        '--env=POLICY_SERVER=0',
         #'--debug',
         #'--log-level=debug',
         'wsgi:application',

@@ -16,6 +16,7 @@ from alarmdecoder.devices import SerialDevice
 
 from .config import DefaultConfig
 from .decoder import decodersocket, Decoder, create_decoder_socket
+from .updater.views import updater
 from .user import User, user
 from .settings import settings
 from .frontend import frontend
@@ -29,9 +30,9 @@ from .zones import zones
 from .settings.models import Setting
 from .setup.constants import SETUP_COMPLETE, SETUP_STAGE_ENDPOINT, SETUP_ENDPOINT_STAGE
 from .setup import setup
-from .updater import updater
 from .extensions import db, mail, cache, login_manager, oid
 from .utils import INSTANCE_FOLDER_PATH
+from .cameras import cameras
 
 
 # For import *
@@ -51,7 +52,46 @@ DEFAULT_BLUEPRINTS = (
     zones,
     setup,
     updater,
+    cameras,
 )
+
+class ReverseProxied(object):
+    '''Wrap the application in this middleware and configure the
+    front-end server to add these headers, to let you quietly bind
+    this to a URL other than / and to an HTTP scheme that is
+    different than what is used locally.
+
+    In nginx:
+    location /myprefix {
+        proxy_pass http://192.168.0.1:5001;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Scheme $scheme;
+        proxy_set_header X-Script-Name /myprefix;
+        }
+
+    :param app: the WSGI application
+    '''
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        script_name = environ.get('HTTP_X_SCRIPT_NAME', '')
+        if script_name:
+            environ['SCRIPT_NAME'] = script_name
+            path_info = environ['PATH_INFO']
+            if path_info.startswith(script_name):
+                environ['PATH_INFO'] = path_info[len(script_name):]
+
+        scheme = environ.get('HTTP_X_SCHEME', '')
+        if scheme:
+            environ['wsgi.url_scheme'] = scheme
+
+        server = environ.get('HTTP_X_FORWARDED_SERVER', '')
+        if server:
+            environ['HTTP_HOST'] = server
+
+        return self.app(environ, start_response)
 
 def create_app(config=None, app_name=None, blueprints=None):
     """Create a Flask app."""
@@ -62,6 +102,8 @@ def create_app(config=None, app_name=None, blueprints=None):
         blueprints = DEFAULT_BLUEPRINTS
 
     app = Flask(app_name, instance_path=INSTANCE_FOLDER_PATH, instance_relative_config=True)
+    app.wsgi_app = ReverseProxied(app.wsgi_app)
+
     configure_app(app, config)
     configure_hook(app)
     configure_blueprints(app, blueprints)
@@ -75,21 +117,28 @@ def create_app(config=None, app_name=None, blueprints=None):
     manager = Manager(app)
     app.decoder = decoder
 
+    return app, appsocket
+
+def init_app(app, appsocket):
     def signal_handler(signal, frame):
-        decoder.stop()
+        appsocket.stop()
+        app.decoder.stop()
         os._exit(0)
 
     try:
         signal.signal(signal.SIGINT, signal_handler)
 
-        decoder.start()
-        decoder.init()
+        # Make sure the database exists.
+        with app.app_context():
+            if db.metadata.tables['settings'].exists(db.engine):
+                app.decoder.init()
+                app.decoder.start()
+            else:
+                app.logger.error("Could not find 'settings' table in the database.  You may need to run 'python manage.py initdb'.")
+                os._exit(0)
 
     except Exception, err:
         app.logger.error("Error", exc_info=True)
-
-    return app, appsocket
-
 
 def configure_app(app, config=None):
     """Different ways of configurations."""
@@ -159,16 +208,15 @@ def configure_template_filters(app):
 def configure_logging(app):
     """Configure file(info) and email(error) logging."""
 
-    if app.debug or app.testing:
-        # Skip debug and test mode. Just check standard output.
-        return
-
     import logging
     from logging.handlers import SMTPHandler
 
     # Set info level on logger, which might be overwritten by handers.
     # Suppress DEBUG messages.
-    app.logger.setLevel(logging.INFO)
+    if app.config['DEBUG']:
+        app.logger.setLevel(logging.DEBUG)
+    else:
+        app.logger.setLevel(logging.INFO)
 
     info_log = os.path.join(app.config['LOG_FOLDER'], 'info.log')
     info_file_handler = logging.handlers.RotatingFileHandler(info_log, maxBytes=100000, backupCount=10)
@@ -178,24 +226,6 @@ def configure_logging(app):
         '[in %(pathname)s:%(lineno)d]')
     )
     app.logger.addHandler(info_file_handler)
-
-    # Testing
-    #app.logger.info("testing info.")
-    #app.logger.warn("testing warn.")
-    #app.logger.error("testing error.")
-
-    mail_handler = SMTPHandler(app.config['MAIL_SERVER'],
-                               app.config['MAIL_USERNAME'],
-                               app.config['ADMINS'],
-                               'O_ops... %s failed!' % app.config['PROJECT'],
-                               (app.config['MAIL_USERNAME'],
-                                app.config['MAIL_PASSWORD']))
-    mail_handler.setLevel(logging.ERROR)
-    mail_handler.setFormatter(logging.Formatter(
-        '%(asctime)s %(levelname)s: %(message)s '
-        '[in %(pathname)s:%(lineno)d]')
-    )
-    app.logger.addHandler(mail_handler)
 
 
 def configure_hook(app):
@@ -230,7 +260,6 @@ def configure_hook(app):
 
 
 def configure_error_handlers(app):
-
     @app.errorhandler(403)
     def forbidden_page(error):
         return render_template("errors/forbidden_page.html"), 403

@@ -20,6 +20,7 @@
         <p>
             <b>System Uptime: </b>{{uptime}}<br/> 
             <a href="{{url_for('settings.system_reboot')}}" class="btn btn-primary">Reboot</a>
+            <a href="{{url_for('settings.system_shutdown')}}" class="btn btn-primary">Shutdown</a>
         </p>
     </div>
 </div>
@@ -85,6 +86,7 @@
     }
 
     $(document).ready(function() {
+        createFormTooltip('#ethernet_devices', 'Please select a device.');
         get_ethernet_properties($('#ethernet_devices').val());
         $('#ethernet_devices').on('change', function() {
             var selectedVal = $('#ethernet_devices').val();

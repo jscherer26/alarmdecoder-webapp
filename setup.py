@@ -4,7 +4,7 @@ from setuptools import setup
 
 setup(
     name="alarmdecoder-webapp",
-    version='0.1',
+    version='0.5.0',
     url='https://github.com/nutechsoftware/alarmdecoder-webapp',
     description='AlarmDecoder-webapp provides a web interface for your AlarmDecoder device.',
     author='Nu Tech Software Solutions, Inc.',
@@ -33,9 +33,6 @@ setup(
         'sh',
         'alembic',
         'netifaces',
-    ],
-    dependency_links=[
-        'https://github.com/eblot/pyftdi/archive/v0.9.0.tar.gz#egg=pyftdi-0.9.0'
     ],
     test_suite='tests',
     classifiers=[

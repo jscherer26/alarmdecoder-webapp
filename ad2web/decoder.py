@@ -10,6 +10,7 @@ from socketio import socketio_manage
 from socketio.namespace import BaseNamespace
 from socketio.mixins import BroadcastMixin
 from socketio.server import SocketIOServer
+from socketioflaskdebug.debugger import SocketIODebugger
 
 from flask import Blueprint, Response, request, g, current_app
 import jsonpickle
@@ -25,16 +26,22 @@ from .settings.models import Setting
 from .certificate.models import Certificate
 from .updater import Updater
 
-from .notifications.constants import (ARM, DISARM, POWER_CHANGED, ALARM, FIRE,
-                                        BYPASS, BOOT, CONFIG_RECEIVED, ZONE_FAULT,
-                                        ZONE_RESTORE, LOW_BATTERY, PANIC,
-                                        RELAY_CHANGED)
+from .notifications.models import NotificationMessage
+from .notifications.constants import (ARM, DISARM, POWER_CHANGED, ALARM, ALARM_RESTORED,
+                                        FIRE, BYPASS, BOOT, CONFIG_RECEIVED, ZONE_FAULT,
+                                        ZONE_RESTORE, LOW_BATTERY, PANIC, RELAY_CHANGED,
+                                        DEFAULT_EVENT_MESSAGES)
+
+from .cameras import CameraSystem
+from .cameras.models import Camera
+
 
 EVENT_MAP = {
     ARM: 'on_arm',
     DISARM: 'on_disarm',
     POWER_CHANGED: 'on_power_changed',
     ALARM: 'on_alarm',
+    ALARM_RESTORED: 'on_alarm_restored',
     FIRE: 'on_fire',
     BYPASS: 'on_bypass',
     BOOT: 'on_boot',
@@ -49,7 +56,9 @@ EVENT_MAP = {
 decodersocket = Blueprint('sock', __name__, url_prefix='/socket.io')
 
 def create_decoder_socket(app):
-    return SocketIOServer(('', 5000), app, resource="socket.io")
+    debugged_app = SocketIODebugger(app, namespace=DecoderNamespace)
+
+    return SocketIOServer(('', 5000), debugged_app, resource="socket.io")
 
 class Decoder(object):
     """
@@ -71,6 +80,7 @@ class Decoder(object):
             self.device = None
             self.updater = Updater()
             self.updates = {}
+            self.version = ''
 
             self.trigger_reopen_device = False
             self.trigger_restart = False
@@ -82,6 +92,17 @@ class Decoder(object):
             self._event_thread = DecoderThread(self)
             self._version_thread = VersionChecker(self)
             self._notifier_system = None
+            self._internal_address_mask = 0xFFFFFFFF
+
+    @property
+    def internal_address_mask(self):
+        return self._internal_address_mask
+
+    @internal_address_mask.setter
+    def internal_address_mask(self, mask):
+        self._internal_address_mask = int(mask, 16)
+        if self.device is not None:
+            self.device.internal_address_mask = int(mask, 16)
 
     def start(self):
         """
@@ -89,6 +110,7 @@ class Decoder(object):
         """
         self._event_thread.start()
         self._version_thread.start()
+        self._camera_thread.start()
 
     def stop(self, restart=False):
         """
@@ -104,11 +126,13 @@ class Decoder(object):
 
         self._event_thread.stop()
         self._version_thread.stop()
+        self._camera_thread.stop()
 
         if restart:
             try:
                 self._event_thread.join(5)
                 self._version_thread.join(5)
+                self._camera_thread.join(5)
             except RuntimeError:
                 pass
 
@@ -126,10 +150,32 @@ class Decoder(object):
         with self.app.app_context():
             device_type = Setting.get_by_name('device_type').value
 
+            # Add any default event messages that may be missing due to additions.
+            for event, message in DEFAULT_EVENT_MESSAGES.iteritems():
+                if not NotificationMessage.query.filter_by(id=event).first():
+                    db.session.add(NotificationMessage(id=event, text=message))
+            db.session.commit()
+
+            self.version = self.updater._components['webapp'].version
+            current_app.jinja_env.globals['version'] = self.version
+
+            current_app.logger.info('AlarmDecoder Webapp booting up - v{0}'.format(self.version))
+
+            # HACK: giant hack.. fix when we know this works.
+            self.updater._components['webapp']._db_updater.refresh()
+
+            if self.updater._components['webapp']._db_updater.needs_update:
+                current_app.logger.debug('Database needs updating!')
+
+                self.updater._components['webapp']._db_updater.update()
+            else:
+                current_app.logger.debug('Database is good!')
+
             if device_type:
                 self.trigger_reopen_device = True
 
             self._notifier_system = NotificationSystem()
+            self._camera_thread = CameraChecker(self)
 
     def open(self):
         """
@@ -138,6 +184,7 @@ class Decoder(object):
         with self.app.app_context():
             self._device_type = Setting.get_by_name('device_type').value
             self._device_location = Setting.get_by_name('device_location').value
+            self._internal_address_mask = int(Setting.get_by_name('internal_address_mask', 'FFFFFFF').value, 16)
 
             if self._device_type:
                 interface = ('localhost', 10000)
@@ -167,6 +214,8 @@ class Decoder(object):
                         device.ssl_key = internal_cert.key_obj
 
                     self.device = AlarmDecoder(device)
+                    self.device.internal_address_mask = self._internal_address_mask
+
                     self.bind_events()
                     self.device.open(baudrate=self._device_baudrate)
 
@@ -191,8 +240,8 @@ class Decoder(object):
         Binds the internal event handlers so that we can handle events from the
         AlarmDecoder library.
         """
-        build_event_handler = lambda ftype: lambda sender, *args, **kwargs: self._handle_event(ftype, sender, *args, **kwargs)
-        build_message_handler = lambda ftype: lambda sender, *args, **kwargs: self._on_message(ftype, sender, *args, **kwargs)
+        build_event_handler = lambda ftype: lambda sender, **kwargs: self._handle_event(ftype, sender, **kwargs)
+        build_message_handler = lambda ftype: lambda sender, **kwargs: self._on_message(ftype, sender, **kwargs)
 
         self.device.on_message += build_message_handler('panel')
         self.device.on_lrr_message += build_message_handler('lrr')
@@ -204,8 +253,12 @@ class Decoder(object):
 
         # Bind the event handler to all of our events.
         for event, device_event_name in EVENT_MAP.iteritems():
-            device_handler = getattr(self.device, device_event_name)
-            device_handler += build_event_handler(event)
+            try:
+                device_handler = getattr(self.device, device_event_name)
+                device_handler += build_event_handler(event)
+
+            except AttributeError, ex:
+                self.app.logger.warning('Could not bind event "%s": alarmdecoder library is probably out of date.', device_event_name)
 
     def refresh_notifier(self, id):
         self._notifier_system.refresh_notifier(id)
@@ -237,7 +290,7 @@ class Decoder(object):
         self.broadcast('device_close')
         self.trigger_reopen_device = True
 
-    def _on_message(self, ftype, sender, *args, **kwargs):
+    def _on_message(self, ftype, sender, **kwargs):
         """
         Internal event handler for when the device receives a message.
 
@@ -256,7 +309,7 @@ class Decoder(object):
         except Exception, err:
             self.app.logger.error('Error while broadcasting message.', exc_info=True)
 
-    def _handle_event(self, ftype, sender, *args, **kwargs):
+    def _handle_event(self, ftype, sender, **kwargs):
         """
         Internal event handler for other events from the AlarmDecoder.
 
@@ -362,6 +415,8 @@ class DecoderThread(threading.Thread):
 
                     # Handle service restart events
                     if self._decoder.trigger_restart:
+                        self._decoder.updates = {}
+                        self._decoder.app.jinja_env.globals['update_available'] = False
                         self._decoder.app.logger.info('Restarting service..')
                         self._decoder.stop(restart=True)
 
@@ -403,10 +458,52 @@ class VersionChecker(threading.Thread):
         self._running = True
 
         while self._running:
-            self._decoder.updates = self._updater.check_updates()
+            with self._decoder.app.app_context():
+                self._decoder.updates = self._updater.check_updates()
+                update_available = not all(not needs_update for component, (needs_update, branch, revision, new_revision, status) in self._decoder.updates.iteritems())
+
+                current_app.jinja_env.globals['update_available'] = update_available
 
             time.sleep(self.TIMEOUT)
 
+class CameraChecker(threading.Thread):
+    """
+    Thread responsible for polling camera streams.
+    """
+    TIMEOUT = 1
+    """Camera checker thread sleep time."""
+
+    def __init__(self, decoder):
+        """
+        Constructor
+        :param decoder: Parent decoder object
+        :type decoder: Decoder
+        """
+        threading.Thread.__init__(self)
+        self._decoder = decoder
+        self._running = False
+        self._cameras = CameraSystem()
+
+    def stop(self):
+        """
+        Stops the thread.
+        """
+        self._running = False
+
+    def run(self):
+        """
+        The thread processing loop.
+        """
+        self._running = True
+
+        while self._running:
+            with self._decoder.app.app_context():
+                self._cameras.refresh_camera_ids()
+                for n in self._cameras.get_camera_ids():
+                    self._cameras.write_image(n)
+
+            time.sleep(self.TIMEOUT)
+        
 class DecoderNamespace(BaseNamespace, BroadcastMixin):
     """
     Socket.IO namespace
@@ -440,7 +537,7 @@ class DecoderNamespace(BaseNamespace, BroadcastMixin):
                 else:
                     self._alarmdecoder.device.send(key)
 
-            except CommError, err:
+            except (CommError, AttributeError), err:
                 self._alarmdecoder.app.logger.error('Error sending keypress to device', exc_info=True)
 
     def on_test(self, *args):

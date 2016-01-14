@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+import os
+
 from flask import Blueprint, render_template, abort, g, request, flash, Response, url_for, redirect
 from flask import current_app as APP
 from flask.ext.login import login_required, current_user
@@ -10,6 +12,9 @@ from .constants import ARM, DISARM, POWER_CHANGED, ALARM, FIRE, BYPASS, BOOT, \
                         CONFIG_RECEIVED, ZONE_FAULT, ZONE_RESTORE, LOW_BATTERY, \
                         PANIC, RELAY_CHANGED, EVENT_TYPES
 from .models import EventLogEntry
+from ..logwatch import LogWatcher
+from ..utils import INSTANCE_FOLDER_PATH
+
 import json
 import collections
 
@@ -55,6 +60,25 @@ def delete():
     events = EventLogEntry.query.delete()
     db.session.commit()
     return redirect(url_for('log.events'))
+
+@log.route('/alarmdecoder')
+@login_required
+@admin_required
+def alarmdecoder_logfile():
+    return render_template('log/alarmdecoder.html', active='AlarmDecoder')
+
+@log.route('/alarmdecoder/get_data/<int:lines>', methods=['GET'])
+@login_required
+@admin_required
+def get_log_data(lines):
+    log_file = os.path.join(INSTANCE_FOLDER_PATH, 'logs', 'info.log')
+
+    try:
+        log_text = LogWatcher.tail(log_file, lines)
+    except IOError, err:
+        return json.dumps([str(err)])
+
+    return json.dumps(log_text)
 
 #XHR for retrieving event log data server side
 @log.route('/retrieve_events_paging_data')

@@ -2,6 +2,7 @@
 
 import os
 import glob
+import platform
 
 from flask import Blueprint, render_template, abort, g, request, flash, Response, redirect, url_for
 from flask import current_app
@@ -74,7 +75,14 @@ def type():
 @setup.route('/local', methods=['GET', 'POST'])
 @admin_or_first_run_required
 def local():
-    device_search_path = '/sys/bus/usb-serial/devices/*'
+    operating_system = platform.system()
+    device_search_path = None
+
+    if operating_system != 'Darwin' and operating_system != 'Windows':
+        device_search_path = '/dev/ttyUSB*'
+    else:
+        device_search_path = '/dev/tty.usb*'
+
     device_type = Setting.get_by_name('device_type').value
 
     form = None
@@ -83,6 +91,11 @@ def local():
         form = LocalDeviceForm()
     else:
         form = LocalDeviceFormUSB()
+        usb_devices = _iterate_usb(device_search_path)
+        if not usb_devices:
+            flash('No devices found - please make sure your AD2USB is plugged into a USB Port and refresh the page.', 'error')
+
+        form.device_path.choices = [(usb_devices[i], usb_devices[i]) for i in usb_devices]
 
     if not form.is_submitted():
         if device_type != 'AD2USB':
@@ -115,9 +128,13 @@ def local():
 
     if form.validate_on_submit():
         device_path = Setting.get_by_name('device_path')
+
+        if device_type == 'AD2USB':
+            usb_devices = _iterate_usb(device_search_path)
+            form.device_path.choices = [(usb_devices[i], usb_devices[i]) for i in usb_devices]
+
         baudrate = Setting.get_by_name('device_baudrate')
         managed = Setting.get_by_name('managed_ser2sock')
-
         device_path.value = form.device_path.data
         baudrate.value = form.baudrate.data
         managed.value = form.confirm_management.data
@@ -130,10 +147,11 @@ def local():
         if form.confirm_management.data == True:
             next_stage = 'setup.sslserver'
         else:
-            try:
-                ser2sock.stop()
-            except OSError:
-                flash("We've detected that ser2sock is running and failed to stop it.  There may be communication issues unless it is killed manually.", 'warning')
+            if ser2sock.exists():
+                try:
+                    ser2sock.stop()
+                except OSError:
+                    flash("We've detected that ser2sock is running and failed to stop it.  There may be communication issues unless it is killed manually.", 'warning')
 
         set_stage(SETUP_ENDPOINT_STAGE[next_stage])
         db.session.commit()
@@ -287,6 +305,7 @@ def sslserver():
                 'device_port': device_port.value,
                 'device_baudrate': Setting.get_by_name('device_baudrate').value,
                 'device_port': device_port.value,
+                'raw_device_mode': 1,
                 'use_ssl': use_ssl.value,
                 'ca_cert': ca,
                 'server_cert': server_cert
@@ -399,6 +418,7 @@ def device():
             form.panel_mode.data = current_app.decoder.device.mode
             form.keypad_address.data = current_app.decoder.device.address
             form.address_mask.data = '{0:x}'.format(current_app.decoder.device.address_mask)
+            form.internal_address_mask.data = '{0:x}'.format(current_app.decoder.internal_address_mask)
             form.lrr_enabled.data = current_app.decoder.device.emulate_lrr
             form.deduplicate.data = current_app.decoder.device.deduplicate
             form.zone_expanders.data = [str(idx + 1) if value == True else None for idx, value in enumerate(current_app.decoder.device.emulate_zone)]
@@ -415,6 +435,10 @@ def device():
             address_mask = Setting.get_by_name('address_mask').value
             if address_mask is not None:
                 form.address_mask.data = address_mask
+
+            internal_address_mask = Setting.get_by_name('internal_address_mask').value
+            if internal_address_mask is not None:
+                form.internal_address_mask.data = internal_address_mask
 
             lrr_enabled = Setting.get_by_name('lrr_enabled').value
             if lrr_enabled is not None:
@@ -437,6 +461,7 @@ def device():
             panel_mode = Setting.get_by_name('panel_mode')
             keypad_address = Setting.get_by_name('keypad_address')
             address_mask = Setting.get_by_name('address_mask')
+            internal_address_mask = Setting.get_by_name('internal_address_mask')
             lrr_enabled = Setting.get_by_name('lrr_enabled')
             zone_expanders = Setting.get_by_name('emulate_zone_expanders')
             relay_expanders = Setting.get_by_name('emulate_relay_expanders')
@@ -448,6 +473,7 @@ def device():
             panel_mode.value = form.panel_mode.data
             keypad_address.value = form.keypad_address.data
             address_mask.value = form.address_mask.data
+            internal_address_mask.value = form.internal_address_mask.data
             lrr_enabled.value = form.lrr_enabled.data
             zone_expanders.value = ','.join([str(x) for x in zx])
             relay_expanders.value = ','.join([str(x) for x in rx])
@@ -458,6 +484,7 @@ def device():
             db.session.add(panel_mode)
             db.session.add(keypad_address)
             db.session.add(address_mask)
+            db.session.add(internal_address_mask)
             db.session.add(lrr_enabled)
             db.session.add(zone_expanders)
             db.session.add(relay_expanders)

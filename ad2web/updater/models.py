@@ -1,3 +1,8 @@
+import os
+import sys
+import logging
+import shutil
+
 import sh
 import sqlalchemy.exc
 from sqlalchemy import create_engine, pool
@@ -6,6 +11,25 @@ from alembic.migration import MigrationContext
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from flask import current_app
+
+try:
+    current_app._get_current_object()
+    running_in_context = True
+except RuntimeError:
+    running_in_context = False
+
+def _print(*args, **kwargs):
+    fmt, arguments = args[0], args[1:]
+    print fmt.format(*arguments)
+
+def _log(*args, **kwargs):
+    logLevel = kwargs.pop('logLevel', logging.INFO)
+
+    if running_in_context:
+        current_app.logger.log(logLevel, *args, **kwargs)
+    else:
+        _print(*args, **kwargs)
+
 
 class Updater(object):
     """
@@ -17,7 +41,9 @@ class Updater(object):
         """
         self._components = {}
 
-        self._components['webapp'] = SourceUpdater('webapp')
+        self._components['webapp'] = WebappUpdater('webapp')
+        # TODO: alarmdecoder library goes here, if installed from source.
+        # TODO: ser2sock goes here, if installed from source.
 
     def check_updates(self):
         """
@@ -44,6 +70,8 @@ class Updater(object):
         """
         ret = {}
 
+        _log('Starting update process..')
+
         if component_name is not None:
             component = self._components[component_name]
 
@@ -53,7 +81,136 @@ class Updater(object):
                 if component.needs_update():
                     ret[component_name] = component.update()
 
+        _log('Update process finished.')
+
         return ret
+
+
+class WebappUpdater(object):
+    """
+    Update system for the webapp.  Encapsulates source and database for this product.
+    """
+
+    def __init__(self, name):
+        """
+        Constructor
+
+        :param name: Name of the component
+        :type name: string
+        """
+
+        self.name = name
+        #self._enabled, self._status = self._check_enabled()
+        self._enabled = True
+
+        self._source_updater = SourceUpdater('webapp')
+        self._db_updater = DBUpdater()
+
+    @property
+    def branch(self):
+        """Returns the current branch"""
+        return self._source_updater.branch
+
+    @property
+    def local_revision(self):
+        """Returns the current local revision"""
+        return self._source_updater.local_revision
+
+    @property
+    def remote_revision(self):
+        """Returns the current remote revision"""
+        return self._source_updater.remote_revision
+
+    @property
+    def commit_count(self):
+        """Returns the number of commits behind and ahead of the remote branch"""
+        return self._source_updater.commits_behind, self._source_updater.commits_ahead
+
+    @property
+    def status(self):
+        """Returns the status string"""
+        return self._source_updater.status
+
+    @property
+    def needs_update(self):
+        """Determines if a component needs an update"""
+        if self._enabled:
+            behind, ahead = self._source_updater.commit_count
+
+            if behind is not None and behind > 0:
+                return True
+
+        return False
+
+    @property
+    def version(self):
+        version = ''
+
+        try:
+            version = sh.git('describe', tags=True, always=True, long=True)
+        except:
+            pass
+
+        return version.strip()
+
+    def refresh(self):
+        """
+        Refreshes the component status
+        """
+
+        if not self._enabled:
+            return
+
+        self._source_updater.refresh()
+        self._db_updater.refresh()
+
+    def update(self):
+        """
+        Performs the update
+
+        :returns: Returns the update results
+        """
+        _log('WebappUpdater: starting..')
+
+        ret = { 'status': 'FAIL', 'restart_required': False }
+
+        if not self._enabled:
+            _log('WebappUpdater: disabled')
+            return ret
+
+        git_succeeded = False
+        db_succeeded = False
+        git_revision = self._source_updater.local_revision
+        db_revision = self._db_updater.current_revision
+
+        try:
+            git_succeeded = self._source_updater.update()
+
+            if git_succeeded:
+                self._db_updater.refresh()
+                db_succeeded = self._db_updater.update()
+
+        except sh.ErrorReturnCode, err:
+            git_succeeded = False
+
+        if not git_succeeded or not db_succeeded:
+            _log('WebappUpdater: failed - [{0},{1}]'.format(git_succeeded, db_succeeded), logLevel=logging.ERROR)
+
+            if not db_succeeded:
+                self._db_updater.downgrade(db_revision)
+
+            if not git_succeeded or not db_succeeded:
+                self._source_updater.reset(git_revision)
+
+            return ret
+
+        _log('WebappUpdater: success')
+
+        ret['status'] = 'PASS'
+        ret['restart_required'] = True
+
+        return ret
+
 
 class SourceUpdater(object):
     """
@@ -79,8 +236,6 @@ class SourceUpdater(object):
         self._commits_ahead = 0
         self._commits_behind = 0
         self._enabled, self._status = self._check_enabled()
-
-        self._db_updater = DBUpdater()
 
     @property
     def branch(self):
@@ -134,25 +289,43 @@ class SourceUpdater(object):
         self._retrieve_remote_revision()
         self._retrieve_commit_count()
 
-        self._db_updater.refresh()
-
     def update(self):
         """
         Performs the update
 
         :returns: Returns the update results
         """
+        _log('SourceUpdater: starting..')
+
         if not self._enabled:
-            return { 'status': 'FAIL', 'restart_required': False }
+            _log('SourceUpdater: disabled')
+            return False
+
+        git_succeeded = False
+        git_revision = self.local_revision
 
         try:
-            results = self._git.merge('origin/{0}'.format(self.branch))
+            self._git.merge('origin/{0}'.format(self.branch))
+            git_succeeded = True
 
-            self._db_updater.update()
         except sh.ErrorReturnCode, err:
-            return { 'status': 'FAIL', 'restart_required': False }
+            git_succeeded = False
 
-        return { 'status': 'PASS', 'restart_required': True }
+        if not git_succeeded:
+            _log('SourceUpdater: failed.', logLevel=logging.ERROR)
+
+            return False
+
+        _log('SourceUpdater: success')
+
+        return True
+
+    def reset(self, revision):
+        try:
+            self._git('reset', '--hard', revision)
+        except sh.ErrorReturnCode:
+            # TODO do something here?
+            pass
 
     def _retrieve_commit_count(self):
         """
@@ -271,11 +444,14 @@ class SourceUpdater(object):
         if not self._git:
             return True
 
-        remotes = self._git.remote(v=True)
-        for r in remotes.strip().split("\n"):
-            name, path = r.split("\t")
-            if name == 'origin' and '@' in path:
-                return False
+        try:
+            remotes = self._git.remote(v=True)
+            for r in remotes.strip().split("\n"):
+                name, path = r.split("\t")
+                if name == 'origin' and '@' in path:
+                    return False
+        except sh.ErrorReturnCode_128:
+            return False
 
         return True
 
@@ -329,19 +505,58 @@ class DBUpdater(object):
 
         self._close()
 
+        return True
+
     def update(self):
         """
         Performs the update
 
         :returns: The update results
         """
+
         if self._current_revision != self._newest_revision:
+            _log('DBUpdater: starting..')
+
             try:
-                command.upgrade(self._config, 'head')
+                script_directory = ScriptDirectory.from_config(self._config)
+
+                revision_list = []
+                for script in script_directory.walk_revisions(self._current_revision, self._newest_revision):
+                    if script.revision != self._current_revision:
+                        revision_list.append(script.revision)
+
+                for rev in reversed(revision_list):
+                    try:
+                        _log('Applying database revision: {0}'.format(rev))
+                        command.upgrade(self._config, rev)
+                    except sqlalchemy.exc.OperationalError, err:
+                        if 'already exists' in str(err):
+                            _log('Table already exists.. stamping to revision.')
+                            self._stamp_database(rev)
+
             except sqlalchemy.exc.OperationalError, err:
+                _log('DBUpdater: failure - {0}'.format(err), logLevel=logging.ERROR)
+
                 return False
 
+            _log('DBUpdater: success')
+
         return True
+
+    def downgrade(self, rev):
+        try:
+            command.downgrade(self._config, rev)
+
+        except sqlalchemy.exc.OperationalError, err:
+            _log('DBUpdater: failed to downgrade release: {0}'.format(err), logLevel=logging.ERROR)
+            raise err
+
+    def _stamp_database(self, rev):
+        try:
+            command.stamp(self._config, rev)
+        except sqlalchemy.exc.OperationalError, err:
+            _log('DBUpdater: stamp database - failure - {0}'.format(err), logLevel=logging.ERROR)
+            raise err
 
     def _open(self):
         """

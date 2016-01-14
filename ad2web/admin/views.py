@@ -38,7 +38,7 @@ def users():
 @login_required
 @admin_required
 def user(user_id):
-    user = None
+    user = User()
     form = UserForm()
 
     if user_id is not None:
@@ -46,13 +46,13 @@ def user(user_id):
         form = UserForm(obj=user, next=request.args.get('next'))
 
     if form.validate_on_submit():
-        user = User()
         form.populate_obj(user)
 
         db.session.add(user)
         db.session.commit()
 
         flash('User created.' if user_id is None else 'User updated.', 'success')
+        return redirect(url_for('admin.users'))
 
     use_ssl = Setting.get_by_name('use_ssl', default=False).value
 
